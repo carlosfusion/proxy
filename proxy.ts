@@ -2,7 +2,7 @@ import fs from "fs";
 import http from "http";
 import https from "https";
 import httpProxy from "http-proxy";
-import { getNodeList, listen, Node, Action } from "./discovery";
+import { getNodeList, listen, Node, Action, cleanUpNode } from "./discovery";
 
 const HTTPS_PORT = 443;
 const HTTP_PORT = Number(process.env.PORT || 80);
@@ -63,9 +63,22 @@ function register(node: Node) {
     socket.setTimeout(SOCKET_TIMEOUT);
   });
 
-  proxy.on("error", (err, req) => {
+  proxy.on("error", (err, req, res) => {
     console.error(`Proxy error during: ${req.url}`);
     console.error(err.stack);
+
+    const errorMessage = err.message.toLowerCase();
+    if(!errorMessage.includes("socket hang up") && !errorMessage.includes("econnreset")) {
+      console.warn(`node ${node.processId}/${node.address} failed, unregistering`);
+      unregister(node);
+      cleanUpNode(node).then(() => console.log(`cleaned up ${node.processId} presence`));
+
+      if (res instanceof http.ServerResponse) {
+        reqHandler(req, res); // try again!
+      }
+    } else {
+      res.end();
+    }
   });
 
   processIds[node.processId] = proxy;
@@ -76,11 +89,14 @@ function register(node: Node) {
 
 function unregister(node: Node) {
   const proxy = processIds[node.processId];
+  const idx = proxies.indexOf(proxy);
 
-  proxies.splice(proxies.indexOf(proxy), 1);
-  delete processIds[node.processId];
+  if(idx > -1) {
+    proxies.splice(proxies.indexOf(proxy), 1);
+    delete processIds[node.processId];
 
-  currProxy = proxies.length - 1;
+    currProxy = proxies.length - 1;
+  }
 }
 
 // listen for node additions and removals through Redis
@@ -107,6 +123,8 @@ const reqHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
 
   } else {
     console.error("No proxy available!", processIds);
+    res.statusCode = 503;
+    res.end();
   }
 };
 
@@ -123,10 +141,13 @@ server.on('error', (err) => {
   console.error(`Server error: ${err.stack}`);
 });
 
-server.on('upgrade', (req, socket, head) => {
+server.on('upgrade', (req: http.IncomingMessage, socket, head) => {
   const proxy = getProxy(req.url!);
 
   if (proxy) {
+    // forward original ip
+    req.headers['x-forwarded-for'] = req.connection.remoteAddress;
+
     proxy.ws(req, socket, head);
 
   } else {
